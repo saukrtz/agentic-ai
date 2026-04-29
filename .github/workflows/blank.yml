@@ -1,0 +1,124 @@
+name: Runtime ETL Pipeline (Snowflake + Groq Agent)
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+    inputs:
+      pipeline_name:
+        description: 'Name of the pipeline'
+        required: true
+        default: 'manual_etl_run'
+      source_table:
+        description: 'Source table (DB.SCHEMA.TABLE)'
+        required: true
+      target_table:
+        description: 'Target table (DB.SCHEMA.TABLE)'
+        required: true
+      warehouse:
+        description: 'Snowflake Warehouse'
+        required: false
+        default: 'COMPUTE_WH'
+
+jobs:
+  run-etl:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: |
+          pip install snowflake-connector-python langchain-groq
+
+      - name: Generate and Run ETL
+        env:
+          # Secrets
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+          SNOWFLAKE_ROLE: ${{ secrets.SNOWFLAKE_ROLE }}
+          SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
+          SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
+          # Variables or Inputs
+          SOURCE_TABLE: ${{ github.event.inputs.source_table || vars.ETL_SOURCE_TABLE }}
+          TARGET_TABLE: ${{ github.event.inputs.target_table || vars.ETL_TARGET_TABLE }}
+          WAREHOUSE: ${{ github.event.inputs.warehouse || vars.SNOWFLAKE_WAREHOUSE || 'COMPUTE_WH' }}
+        run: |
+          python - <<EOF
+          import os
+          import snowflake.connector
+          from langchain_groq import ChatGroq
+          from langchain_core.messages import HumanMessage, SystemMessage
+
+          # 1. Initialize Groq Client
+          llm = ChatGroq(
+              temperature=0,
+              model_name="llama-3.1-8b-instant",
+              groq_api_key=os.environ["GROQ_API_KEY"]
+          )
+
+          # 2. Build Prompt[cite: 1]
+          source = os.environ["SOURCE_TABLE"]
+          target = os.environ["TARGET_TABLE"]
+          
+          system_msg = "You are a Snowflake SQL expert. Return ONLY a single SELECT statement. No prose, no markdown."
+          user_msg = f"Generate a transformation SELECT statement from {source} to populate {target}. Perform standard column mapping."
+
+          # 3. Get LLM Output & Sanitize[cite: 1]
+          response = llm.invoke([SystemMessage(content=system_msg), HumanMessage(content=user_msg)])
+          raw_sql = response.content.strip()
+          print(f"--- RAW MODEL OUTPUT ---\n{raw_sql}\n")
+
+          clean_sql = raw_sql.replace('\\\`\\\`\\\`sql', '').replace('\\\`\\\`\\\`', '').strip()
+          # Final validation check[cite: 1]
+          if not clean_sql.upper().startswith("SELECT"):
+              lines = clean_sql.splitlines()
+              clean_sql = next((line for line in lines if line.upper().startswith("SELECT")), None)
+
+          if not clean_sql:
+              raise ValueError("Model failed to return a valid SELECT statement.")
+          
+          print(f"--- FINAL CLEANED SELECT ---\n{clean_sql}\n")
+
+          # 4. Snowflake Execution[cite: 1]
+          conn = snowflake.connector.connect(
+              account=os.environ["SNOWFLAKE_ACCOUNT"],
+              user=os.environ["SNOWFLAKE_USER"],
+              password=os.environ["SNOWFLAKE_PASSWORD"],
+              role=os.environ["SNOWFLAKE_ROLE"],
+              database=os.environ["SNOWFLAKE_DATABASE"],
+              schema=os.environ["SNOWFLAKE_SCHEMA"],
+              warehouse=os.environ["WAREHOUSE"]
+          )
+          cursor = conn.cursor()
+
+          try:
+              # Preview output (first 10 rows)[cite: 1]
+              print("--- PREVIEW OF QUERY OUTPUT (LIMIT 10) ---")
+              cursor.execute(f"{clean_sql} LIMIT 10")
+              columns = [col[0] for col in cursor.description]
+              print(columns)
+              for row in cursor.fetchall():
+                  print(row)
+
+              # Ensure target table exists (schema only)[cite: 1]
+              cursor.execute(f"CREATE TABLE IF NOT EXISTS {target} AS {clean_sql} WHERE 1=0")
+
+              # Create and Run Task[cite: 1]
+              task_name = f"ETL_TASK_{os.environ.get('GITHUB_RUN_ID')}"
+              cursor.execute(f"CREATE OR REPLACE TASK {task_name} WAREHOUSE = {os.environ['WAREHOUSE']} AS INSERT INTO {target} {clean_sql}")
+              cursor.execute(f"EXECUTE TASK {task_name}")
+              print(f"\nSuccessfully executed Task: {task_name}")
+
+          finally:
+              cursor.close()
+              conn.close()
+          EOF
