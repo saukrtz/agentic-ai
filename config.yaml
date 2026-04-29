@@ -1,0 +1,4 @@
+pipeline_name: "DAILY_ORDERS_PIPELINE"
+source_table: "RAW_DB.RAW_SCHEMA.ST_ORDERS"
+target_table: "DWH_DB.DWH_SCHEMA.TT_ORDERS"
+warehouse: "COMPUTE_WH"
